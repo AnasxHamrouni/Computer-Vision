@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<!-- python -m http.server 8000 to serve -->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spark + Trajectory Visualization</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; font-family: sans-serif; }
+        canvas { display: block; }
+        
+        /* UI Overlay Styles */
+        #ui-container {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            color: white;
+            min-width: 380px;
+            align-items: center;
+            border: 1px solid #444;
+        }
+        
+        #controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            width: 100%;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        button {
+            background: #444; border: none; color: white; padding: 8px 16px;
+            border-radius: 4px; cursor: pointer; font-weight: bold; min-width: 80px;
+        }
+        button:hover { background: #666; }
+
+        #scrubber { width: 100%; cursor: pointer; accent-color: #00ff88; }
+
+        /* Speed control row */
+        #speed-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            justify-content: center;
+            font-size: 12px;
+        }
+        #speedSlider {
+            width: 150px;
+        }
+        
+        #status {
+            position: absolute; top: 10px; left: 10px; color: #aaa; 
+            font-size: 12px; background: rgba(0,0,0,0.5); padding: 5px;
+        }
+
+        /* Scene selection row */
+        #scene-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            justify-content: center;
+            font-size: 12px;
+        }
+        #sceneSelect {
+            background: #222;
+            color: #fff;
+            border: 1px solid #555;
+            border-radius: 4px;
+            padding: 4px 8px;
+            min-width: 220px;
+        }
+
+        /* Detections toggle */
+        #detections-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            justify-content: center;
+            font-size: 12px;
+        }
+        #toggleDetections {
+            background: #222;
+            color: #fff;
+            border: 1px solid #555;
+            border-radius: 4px;
+            padding: 4px 8px;
+            cursor: pointer;
+        }
+        #toggleDetections:hover {
+            background: #333;
+        }
+        #toggleDetections.active {
+            background: #00ff88;
+            color: #000;
+        }
+    </style>
+    
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+            "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+        }
+    }
+    </script>
+</head>
+<body>
+
+    <div id="status">Initializing...</div>
+
+    <!-- UI Overlay -->
+    <div id="ui-container">
+        <!-- Scene selector -->
+        <div id="scene-row">
+            <span>Scene:</span>
+            <select id="sceneSelect">
+                <option value="outdoor-drone">Outdoor Drone</option>
+                <option value="conference-hall">Conference Hall (Indoor)</option>
+            </select>
+        </div>
+
+        <!-- Detections toggle -->
+        <div id="detections-row">
+            <span>Show Detections:</span>
+            <button id="toggleDetections">Off</button>
+            <span id="detectionCount">0 objects</span>
+        </div>
+
+        <div id="controls">
+            <button id="btnPlayPause">⏸ Pause</button>
+            <span id="lblFrame">Frame: 0 / 0</span>
+        </div>
+
+        <!-- Speed control row -->
+        <div id="speed-row">
+            <span>Speed:</span>
+            <input
+                type="range"
+                id="speedSlider"
+                min="0.1"
+                max="4"
+                step="0.1"
+                value="1"
+            >
+            <span id="lblSpeed">1.0×</span>
+        </div>
+
+        <input type="range" id="scrubber" min="0" max="0" value="0" step="1">
+    </div>
+
+    <script type="module">
+        import * as THREE from "three";
+        import { SplatMesh } from "@sparkjsdev/spark";
+
+        // --- Scene config: map scene keys to PLY + trajectory JSON ---
+        // Adjust paths/names for your 5 models.
+        const SCENES = {
+            "outdoor-drone": {
+                label: "Outdoor Drone",
+                ply: "scenes/outdoor-drone/outdoor-drone.ply",
+                path: "scenes/outdoor-drone/trajectory_autonomous.json",
+                detections: "detections/detections_3d.json"
+            },
+            "conference-hall": {
+                label: "Conference Hall (Indoor)",
+                ply: "scenes/conference-hall/ConferenceHall.ply",
+                path: "scenes/conference-hall/trajectory_indoor.json",
+                detections: "detections/detections_indoor.json"
+            }
+        };
+
+        // Playback speed (multiplicative factor, can be fractional)
+        let PLAY_SPEED = 1.0;
+
+        // --- Setup Scene ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // --- State Variables ---
+        let waypoints = [];
+        let frameIndexFloat = 0;
+        let isPlaying = true;
+        let isDragging = false;
+        let currentSplat = null;
+        let detectionsGroup = null;  // Group to hold all detection boxes
+        let showDetections = false;
+
+        // --- UI Elements ---
+        const btnPlay = document.getElementById('btnPlayPause');
+        const lblFrame = document.getElementById('lblFrame');
+        const scrubber = document.getElementById('scrubber');
+        const status = document.getElementById('status');
+        const speedSlider = document.getElementById('speedSlider');
+        const lblSpeed = document.getElementById('lblSpeed');
+        const sceneSelect = document.getElementById('sceneSelect');
+        const toggleDetections = document.getElementById('toggleDetections');
+        const detectionCount = document.getElementById('detectionCount');
+
+        // --- Debug sphere to show camera position ---
+        const debugSphere = new THREE.Mesh(
+            new THREE.SphereGeometry(0.02, 16, 16),
+            new THREE.MeshBasicMaterial({ color: 0xff0000 })
+        );
+        scene.add(debugSphere);
+
+        // --- Detections visualization group ---
+        detectionsGroup = new THREE.Group();
+        scene.add(detectionsGroup);
+
+        // --- Helpers to load / unload splat model ---
+        function unloadCurrentSplat() {
+            if (!currentSplat) return;
+            scene.remove(currentSplat);
+            // SplatMesh may manage its own buffers; if it exposes dispose(), call it.
+            if (typeof currentSplat.dispose === "function") {
+                currentSplat.dispose(); // defensive cleanup [web:96][web:99]
+            }
+            currentSplat = null;
+        }
+
+        function loadSplatForScene(sceneKey) {
+            const cfg = SCENES[sceneKey];
+            if (!cfg) {
+                console.error("Unknown scene key:", sceneKey);
+                return;
+            }
+
+            unloadCurrentSplat();
+
+            const splat = new SplatMesh({
+                url: cfg.ply,
+                logLevel: 'warn',
+                onLoad: (mesh) => {
+                    // Flip model so positive Y points up in the same way as your path
+                    mesh.rotation.x = Math.PI;
+                },
+            });
+
+            currentSplat = splat;
+            scene.add(splat);
+        }
+
+        // --- Load Trajectory for scene ---
+        function loadTrajectoryForScene(sceneKey) {
+            const cfg = SCENES[sceneKey];
+            if (!cfg) return;
+
+            waypoints = [];
+            frameIndexFloat = 0;
+            scrubber.value = 0;
+            scrubber.max = 0;
+            lblFrame.innerText = "Frame: 0 / 0";
+            status.innerText = "Loading trajectory...";
+
+            fetch(cfg.path)
+                .then(res => res.json())
+                .then(data => {
+                    waypoints = data;
+                    status.innerText = `Loaded ${data.length} frames (${cfg.label})`;
+
+                    scrubber.max = data.length - 1;
+                    lblFrame.innerText = `Frame: 0 / ${data.length - 1}`;
+
+                    console.log(`Loaded ${data.length} waypoints for ${sceneKey}.`);
+                    if (data.length > 0) {
+                        console.log(`First waypoint:`, data[0]);
+                    }
+                })
+                .catch(err => {
+                    console.error(err);
+                    status.innerText = `Error loading ${cfg.path}`;
+                });
+        }
+
+        // --- Load Detections for scene ---
+        function loadDetectionsForScene(sceneKey) {
+            const cfg = SCENES[sceneKey];
+            if (!cfg || !cfg.detections) {
+                // Clear detections if scene doesn't have them
+                clearDetections();
+                detectionCount.textContent = "0 objects";
+                return;
+            }
+
+            fetch(cfg.detections)
+                .then(res => res.json())
+                .then(data => {
+                    // Handle both outdoor (detections_3d) and indoor (detections_3d) formats
+                    const detections = data.detections_3d || [];
+                    displayDetections(detections, sceneKey);
+                    
+                    // Update label based on scene type
+                    const isIndoor = sceneKey === "conference-hall";
+                    const objectType = isIndoor ? "furniture items" : "buildings";
+                    detectionCount.textContent = `${detections.length} ${objectType}`;
+                    console.log(`Loaded ${detections.length} detections for ${sceneKey}`);
+                })
+                .catch(err => {
+                    console.error("Error loading detections:", err);
+                    clearDetections();
+                    detectionCount.textContent = "Error loading";
+                });
+        }
+
+        // --- Get color for detection class ---
+        function getDetectionColor(class_name) {
+            // Furniture colors (indoor)
+            if (class_name === "chair") return 0x00ff00; // Green
+            if (class_name === "table" || class_name === "conference_table") return 0x0088ff; // Blue
+            if (class_name === "podium") return 0xff00ff; // Magenta
+            if (class_name === "screen") return 0xffff00; // Yellow
+            if (class_name === "desk") return 0x00ffff; // Cyan
+            if (class_name === "cabinet") return 0xff8800; // Orange
+            if (class_name === "stool") return 0x88ff00; // Lime
+            if (class_name === "furniture") return 0x8888ff; // Light blue
+            
+            // Outdoor colors
+            if (class_name === "building") return 0xff0000; // Red
+            if (class_name === "structure") return 0xff8800; // Orange
+            
+            // Default
+            return 0xffffff; // White
+        }
+
+        // --- Display detections as 3D boxes ---
+        function displayDetections(detections, sceneKey) {
+            clearDetections();
+
+            if (!detections || detections.length === 0) {
+                console.log("No detections to display");
+                return;
+            }
+
+            detections.forEach((det, idx) => {
+                const min = det.bbox_3d.min;
+                const max = det.bbox_3d.max;
+                
+                // Calculate box dimensions
+                const width = max[0] - min[0];
+                const height = max[1] - min[1];
+                const depth = max[2] - min[2];
+
+                // Skip invalid boxes
+                if (width <= 0 || height <= 0 || depth <= 0) {
+                    console.warn(`Skipping invalid detection ${idx}: ${width}x${height}x${depth}`);
+                    return;
+                }
+
+                // Use center_3d from detection, or calculate from bbox
+                const center = det.center_3d ? 
+                    new THREE.Vector3(det.center_3d[0], det.center_3d[1], det.center_3d[2]) :
+                    new THREE.Vector3(
+                        (min[0] + max[0]) / 2,
+                        (min[1] + max[1]) / 2,
+                        (min[2] + max[2]) / 2
+                    );
+
+                // Create box geometry
+                const geometry = new THREE.BoxGeometry(width, height, depth);
+                
+                // Get color based on class
+                const color = getDetectionColor(det.class_name);
+                const material = new THREE.MeshBasicMaterial({ 
+                    color: color,
+                    transparent: true,
+                    opacity: 0.4, // Slightly more visible
+                    wireframe: false,
+                    side: THREE.DoubleSide
+                });
+
+                // Create wireframe outline
+                const wireframe = new THREE.LineSegments(
+                    new THREE.EdgesGeometry(geometry),
+                    new THREE.LineBasicMaterial({ color: color, linewidth: 2 })
+                );
+
+                const box = new THREE.Mesh(geometry, material);
+                box.position.copy(center);
+                box.add(wireframe);
+
+                // Add label
+                const label = `${det.class_name} ${det.object_id}`;
+                box.userData = { label, detection: det };
+
+                detectionsGroup.add(box);
+            });
+
+            console.log(`Displayed ${detectionsGroup.children.length} detection boxes`);
+            updateDetectionsVisibility();
+        }
+
+        // --- Clear all detections ---
+        function clearDetections() {
+            while (detectionsGroup.children.length > 0) {
+                const child = detectionsGroup.children[0];
+                child.geometry.dispose();
+                if (child.material) child.material.dispose();
+                if (child.children) {
+                    child.children.forEach(c => {
+                        if (c.geometry) c.geometry.dispose();
+                        if (c.material) c.material.dispose();
+                    });
+                }
+                detectionsGroup.remove(child);
+            }
+        }
+
+        // --- Update detections visibility ---
+        function updateDetectionsVisibility() {
+            detectionsGroup.visible = showDetections;
+        }
+
+        // --- Switch scene (model + path) ---
+        function switchScene(sceneKey) {
+            const cfg = SCENES[sceneKey];
+            if (!cfg) return;
+
+            isPlaying = false;
+            btnPlay.innerText = "▶ Play";
+
+            loadSplatForScene(sceneKey);
+            loadTrajectoryForScene(sceneKey);
+            loadDetectionsForScene(sceneKey);
+
+            // Optional: reset camera to a generic position each time
+            camera.position.set(0, 0, 2);
+            camera.lookAt(0, 0, 0);
+        }
+
+        // --- UI Event Listeners ---
+        btnPlay.addEventListener('click', () => {
+            isPlaying = !isPlaying;
+            btnPlay.innerText = isPlaying ? "⏸ Pause" : "▶ Play";
+        });
+
+        speedSlider.addEventListener('input', (e) => {
+            PLAY_SPEED = parseFloat(e.target.value);
+            lblSpeed.textContent = `${PLAY_SPEED.toFixed(1)}×`;
+        });
+
+        scrubber.addEventListener('input', (e) => {
+            isDragging = true;
+            const idx = parseInt(e.target.value);
+            frameIndexFloat = idx;
+            updateCameraPose(idx);
+        });
+
+        scrubber.addEventListener('change', () => {
+            isDragging = false;
+        });
+
+        sceneSelect.addEventListener('change', (e) => {
+            const sceneKey = e.target.value;
+            switchScene(sceneKey);
+        });
+        // --- Toggle detections visibility ---
+        toggleDetections.addEventListener('click', () => {
+            // Flip state
+            showDetections = !showDetections;
+
+            // Update group visibility
+            updateDetectionsVisibility();
+
+            // Update button appearance and label
+            if (showDetections) {
+                toggleDetections.classList.add('active');
+                toggleDetections.textContent = 'On';
+            } else {
+                toggleDetections.classList.remove('active');
+                toggleDetections.textContent = 'Off';
+            }
+        });
+
+        // --- Helper: Apply Pose ---
+        function updateCameraPose(idx) {
+            if (!waypoints || waypoints.length === 0) return;
+
+            const frame = waypoints[idx];
+
+            // Position
+            camera.position.set(frame.position.x, frame.position.y, frame.position.z);
+
+            // Rotation
+            camera.quaternion.set(
+                frame.quaternion.x,
+                frame.quaternion.y,
+                frame.quaternion.z,
+                frame.quaternion.w
+            );
+
+            // Debug sphere
+            debugSphere.position.set(frame.position.x, frame.position.y, frame.position.z);
+
+            lblFrame.innerText = `Frame: ${idx} / ${waypoints.length - 1}`;
+        }
+
+        // --- Animation Loop ---
+        renderer.setAnimationLoop(() => {
+            if (waypoints.length > 0) {
+                if (isPlaying && !isDragging) {
+                    frameIndexFloat += PLAY_SPEED;
+
+                    const n = waypoints.length;
+                    if (frameIndexFloat >= n) {
+                        frameIndexFloat = frameIndexFloat % n;
+                    } else if (frameIndexFloat < 0) {
+                        frameIndexFloat = (frameIndexFloat % n + n) % n;
+                    }
+
+                    const idx = Math.floor(frameIndexFloat);
+                    scrubber.value = idx;
+                    updateCameraPose(idx);
+                }
+            }
+            renderer.render(scene, camera);
+        });
+
+        // --- Resize ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+        // --- Initial scene load ---
+        switchScene("conference-hall");
+    </script>
+</body>
+</html>

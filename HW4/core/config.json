@@ -1,0 +1,22 @@
+{
+  "scenes": {
+    "conference-hall": {
+      "ply": "scenes/conference-hall/ConferenceHall.ply",
+      "output": "scenes/conference-hall/trajectory_indoor.json",
+      "frames": 600,
+      "fov": 60.0,
+      "start_position": {
+        "x": null,
+        "y": null,
+        "z": null,
+        "auto_detect": true,
+        "comment": "Set auto_detect to false and provide x, y, z to use specific coordinates"
+      },
+      "exploration": {
+        "comment": "Leave these null to auto-detect from room analysis"
+      }
+    }
+  },
+  "default_scene": "conference-hall"
+}
+
